@@ -4,13 +4,15 @@
 Приложение для работы с системой маркировки Честный ЗНАК (markirovka.crpt.ru)
 с использованием электронной подписи через КриптоПро CSP.
 
-Версия 2.0 - с диалогом выбора сертификата из системного хранилища
+Версия 2.1 - с корректной работой через утилиты КриптоПро (certmgr, cryptcp)
 """
 
 import sys
 import json
 import requests
 import urllib3
+import subprocess
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
@@ -32,15 +34,28 @@ class MarkirovkaAPIError(Exception):
 
 class CryptoProCSP:
     """
-    Класс для работы с КриптоПро CSP через системное хранилище сертификатов.
-    Использует pycades или команду 'certmgr' для выбора сертификата.
+    Класс для работы с КриптоПро CSP через утилиты командной строки.
+    Использует certmgr и cryptcp для выбора сертификата и подписи.
     """
     
     def __init__(self):
-        self.cert_handle = None
-        self.private_key = None
         self.cert_info = None
-        
+        self._check_csp_installed()
+    
+    def _check_csp_installed(self):
+        """Проверка установки КриптоПро CSP"""
+        try:
+            result = subprocess.run(
+                ['certmgr', '-version'],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                print("⚠️  Утилита certmgr не найдена. Убедитесь, что КриптоПро CSP установлен.")
+        except FileNotFoundError:
+            print("⚠️  КриптоПро CSP не найден в PATH. Добавьте пути к утилитам КриптоПро.")
+            print("   Обычно это: /opt/cprocsp/bin/amd64 или C:\\Program Files\\Crypto Pro\\CSP")
+    
     def list_certificates(self) -> List[Dict]:
         """
         Получить список доступных сертификатов в хранилище.
@@ -48,79 +63,80 @@ class CryptoProCSP:
         """
         certificates = []
         
-        # Попытка использовать pycades (предпочтительный вариант)
         try:
-            import pycades
+            # Команда для вывода списка сертификатов с закрытыми ключами
+            result = subprocess.run(
+                ['certmgr', '-list', '-store', 'uMy', '-all'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                encoding='utf-8',
+                errors='replace'
+            )
             
-            # Получаем хранилище личных сертификатов
-            store = pycades.CPStore()
-            store.Open(pycades.CADESCOM_CONTAINER_STORE, pycades.CAPICOM_CURRENT_USER_STORE, "MY")
+            if result.returncode != 0:
+                print(f"⚠️  Ошибка выполнения certmgr: {result.stderr}")
+                return certificates
             
-            certs = store.Certificates
-            for i in range(1, certs.Count + 1):
-                cert = certs.Item(i)
-                cert_info = {
-                    'index': i,
-                    'subject': cert.SubjectName,
-                    'issuer': cert.IssuerName,
-                    'serial': cert.SerialNumber,
-                    'valid_from': cert.ValidFromDate,
-                    'valid_to': cert.ValidToDate,
-                    'thumbprint': cert.Thumbprint,
-                    'has_private_key': cert.HasPrivateKey(),
-                    'template': cert
-                }
-                certificates.append(cert_info)
+            output = result.stdout
+            certificates = self._parse_certmgr_output(output)
             
-            store.Close()
-            
-        except ImportError:
-            # Если pycades не установлен, используем альтернативный метод
-            print("⚠️  pycades не найден. Используем альтернативный метод через certmgr...")
-            certificates = self._list_certificates_via_certmgr()
+        except FileNotFoundError:
+            print("❌ Утилита certmgr не найдена. Проверьте установку КриптоПро CSP.")
+        except Exception as e:
+            print(f"❌ Ошибка при получении списка сертификатов: {e}")
         
         return certificates
     
-    def _list_certificates_via_certmgr(self) -> List[Dict]:
-        """Получение списка сертификатов через утилиту certmgr (Linux/Mac)"""
-        import subprocess
-        
+    def _parse_certmgr_output(self, output: str) -> List[Dict]:
+        """Парсинг вывода утилиты certmgr"""
         certificates = []
-        try:
-            # Команда для вывода списка сертификатов
-            result = subprocess.run(
-                ['certmgr', '-list', '-store', 'uMy'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+        current_cert = {}
+        
+        lines = output.split('\n')
+        cert_index = 0
+        
+        for line in lines:
+            line = line.strip()
             
-            if result.returncode == 0:
-                # Парсим вывод certmgr (упрощенный парсинг)
-                lines = result.stdout.split('\n')
-                current_cert = {}
-                
-                for line in lines:
-                    if 'Subject:' in line:
-                        if current_cert:
-                            certificates.append(current_cert)
-                        current_cert = {'subject': line.split(':', 1)[1].strip()}
-                    elif 'Issuer:' in line:
-                        current_cert['issuer'] = line.split(':', 1)[1].strip()
-                    elif 'Serial:' in line:
-                        current_cert['serial'] = line.split(':', 1)[1].strip()
-                    elif 'Valid from:' in line:
-                        current_cert['valid_from'] = line.split(':', 1)[1].strip()
-                    elif 'Valid to:' in line:
-                        current_cert['valid_to'] = line.split(':', 1)[1].strip()
-                    elif 'Thumbprint:' in line:
-                        current_cert['thumbprint'] = line.split(':', 1)[1].strip()
-                
+            # Ищем начало описания сертификата
+            if re.search(r'\d+\).*Субъект|Subject:', line, re.IGNORECASE):
                 if current_cert:
                     certificates.append(current_cert)
-                    
-        except Exception as e:
-            print(f"⚠️  Ошибка при получении сертификатов через certmgr: {e}")
+                cert_index += 1
+                current_cert = {'index': cert_index}
+            
+            # Парсим поля сертификата
+            if 'Субъект:' in line or 'Subject:' in line:
+                current_cert['subject'] = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif 'Издатель:' in line or 'Issuer:' in line:
+                current_cert['issuer'] = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif 'Серийный номер:' in line or 'Serial:' in line:
+                current_cert['serial'] = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif 'Действителен' in line or 'Valid' in line:
+                if 'с' in line.lower() or 'from' in line.lower():
+                    current_cert['valid_from'] = line.split(':', 1)[1].strip() if ':' in line else ''
+                elif 'по' in line.lower() or 'to' in line.lower():
+                    current_cert['valid_to'] = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif 'Отпечаток' in line or 'Thumbprint' in line or 'SHA1' in line:
+                thumbprint_match = re.search(r'[0-9A-Fa-f]{40}', line)
+                if thumbprint_match:
+                    current_cert['thumbprint'] = thumbprint_match.group(0)
+            
+            # Проверяем наличие закрытого ключа
+            if 'Закрытый ключ' in line or 'Private key' in line:
+                if 'да' in line.lower() or 'yes' in line.lower() or 'имеется' in line.lower():
+                    current_cert['has_private_key'] = True
+                else:
+                    current_cert['has_private_key'] = False
+        
+        if current_cert:
+            certificates.append(current_cert)
+        
+        # Если не нашли has_private_key, считаем что ключ есть (для uMy хранилища)
+        for cert in certificates:
+            if 'has_private_key' not in cert:
+                cert['has_private_key'] = True
         
         return certificates
     
@@ -173,76 +189,77 @@ class CryptoProCSP:
     
     def sign_data(self, data: bytes, cert: Dict) -> str:
         """
-        Подписать данные используя выбранный сертификат.
+        Подписать данные используя выбранный сертификат через утилиту cryptcp.
         Возвращает подпись в формате Base64.
         """
-        try:
-            import pycades
-            import base64
-            
-            # Получаем шаблон сертификата
-            cert_template = cert.get('template')
-            if not cert_template:
-                raise CertStoreError("Отсутствует шаблон сертификата")
-            
-            # Создаем объект подписи
-            signer = pycades.CPSigner()
-            signer.Certificate = cert_template
-            
-            # Настраиваем параметры подписи
-            signer.Options = pycades.CAPICOM_CERTIFICATE_INCLUDE_CHAIN_EXCEPT_ROOT
-            
-            # Создаем объект данных для подписи
-            content = pycades.CPContent()
-            content.Content = data
-            
-            # Выполняем подписание
-            signed_data = pycades.CPSignedData()
-            signed_data.Content = content
-            signed_data.Signer = signer
-            
-            signature = signed_data.SignContent(pycades.CADESCOM_CADES_BES)
-            
-            return base64.b64encode(signature.encode()).decode('utf-8')
-            
-        except ImportError:
-            # Альтернативный метод подписи через openssl (если доступен)
-            return self._sign_via_openssl(data, cert)
-    
-    def _sign_via_openssl(self, data: bytes, cert: Dict) -> str:
-        """Альтернативное подписание через openssl (требует настройки)"""
-        import subprocess
         import tempfile
         import base64
+        import os
         
         thumbprint = cert.get('thumbprint')
         if not thumbprint:
             raise CertStoreError("Не указан отпечаток сертификата")
         
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(data)
-            tmp_filename = tmp_file.name
+        # Создаем временные файлы для данных и подписи
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.dat') as data_file:
+            data_file.write(data)
+            data_filename = data_file.name
+        
+        sig_filename = data_filename + '.sig'
         
         try:
-            # Команда для подписи через openssl с использованием КриптоПро
+            # Команда для подписи через cryptcp
             cmd = [
-                'openssl', 'cms', '-sign',
-                '-in', tmp_filename,
-                '-outform', 'DER',
-                '-signer', thumbprint,
-                '-engine', 'pkcs11'
+                'cryptcp', '-sign',
+                '-dn', f'"{thumbprint}"',
+                '-detached',
+                data_filename,
+                sig_filename
             ]
             
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=60,
+                text=True
+            )
             
             if result.returncode != 0:
-                raise CertStoreError(f"Ошибка подписи: {result.stderr.decode()}")
+                # Пробуем альтернативный синтаксис
+                cmd_alt = [
+                    'cryptcp', '-sign',
+                    '-thumbprint', thumbprint,
+                    '-detached',
+                    data_filename,
+                    sig_filename
+                ]
+                result = subprocess.run(
+                    cmd_alt,
+                    capture_output=True,
+                    timeout=60,
+                    text=True
+                )
+                
+                if result.returncode != 0:
+                    raise CertStoreError(f"Ошибка подписи: {result.stderr}")
             
-            return base64.b64encode(result.stdout).decode('utf-8')
+            # Читаем подпись и кодируем в Base64
+            with open(sig_filename, 'rb') as f:
+                signature_bytes = f.read()
             
+            return base64.b64encode(signature_bytes).decode('utf-8')
+            
+        except FileNotFoundError:
+            print("❌ Утилита cryptcp не найдена. Проверьте установку КриптоПро CSP.")
+            raise CertStoreError("Утилита cryptcp не найдена")
         finally:
-            import os
-            os.unlink(tmp_filename)
+            # Удаляем временные файлы
+            try:
+                os.unlink(data_filename)
+                if os.path.exists(sig_filename):
+                    os.unlink(sig_filename)
+            except:
+                pass
 
 
 class MarkirovkaClient:
@@ -495,7 +512,7 @@ def main():
     
     print("="*70)
     print("ПРИЛОЖЕНИЕ ДЛЯ РАБОТЫ С СИСТЕМОЙ МАРКИРОВКИ ЧЕСТНЫЙ ЗНАК")
-    print("Версия 2.0 - с интерактивным выбором сертификата")
+    print("Версия 2.1 - с выбором сертификата через утилиты КриптоПро")
     print("="*70)
     
     # Парсинг аргументов командной строки
@@ -506,32 +523,80 @@ def main():
                        help='Список кодов транспортных упаковок для обработки')
     parser.add_argument('--test-mode', action='store_true',
                        help='Тестовый режим без реальных вызовов API')
+    parser.add_argument('--thumbprint', '-t', type=str, default=None,
+                       help='Отпечаток сертификата (SHA1) для автоматического выбора')
     
     args = parser.parse_args()
     
     # Инициализация работы с криптопровайдером
     crypto_pro = CryptoProCSP()
     
-    try:
-        # Интерактивный выбор сертификата
-        cert_info = crypto_pro.select_certificate_interactive()
-        crypto_pro.cert_info = cert_info
+    cert_info = None
+    
+    # Проверяем, указан ли отпечаток сертификата в командной строке
+    if args.thumbprint:
+        print(f"\n🔍 Поиск сертификата с отпечатком: {args.thumbprint}")
+        certs = crypto_pro.list_certificates()
         
-    except CertStoreError as e:
-        print(f"\n❌ Ошибка: {e}")
-        print("\nВозможные решения:")
-        print("1. Убедитесь, что КриптоПро CSP установлен и настроен")
-        print("2. Проверьте наличие установленных сертификатов с закрытым ключом")
-        print("3. Установите pycades: pip install pycades")
-        sys.exit(1)
+        if not certs:
+            print("❌ Не найдено доступных сертификатов в хранилище")
+            print("\nВ тестовом режиме продолжаем работу без сертификата...")
+        else:
+            # Ищем сертификат по отпечатку
+            selected_cert = None
+            for cert in certs:
+                cert_thumbprint = cert.get('thumbprint', '').replace(' ', '').upper()
+                search_thumbprint = args.thumbprint.replace(' ', '').upper()
+                
+                if cert_thumbprint == search_thumbprint or cert_thumbprint.endswith(search_thumbprint):
+                    selected_cert = cert
+                    break
+            
+            if not selected_cert:
+                print("❌ Сертификат с указанным отпечатком не найден")
+                print("\nДоступные сертификаты:")
+                for idx, cert in enumerate(certs, 1):
+                    if cert.get('has_private_key', True):
+                        print(f"  [{idx}] {cert.get('subject', 'N/A')[:50]}...")
+                        print(f"      Отпечаток: {cert.get('thumbprint', 'N/A')[:40]}...")
+                sys.exit(1)
+            
+            cert_info = selected_cert
+            print(f"✅ Выбран сертификат: {cert_info.get('subject', 'N/A')}")
+            crypto_pro.cert_info = cert_info
+    elif args.test_mode:
+        # В тестовом режиме создаем фиктивный сертификат
+        print("\n⚠️  Тестовый режим: работа без реального сертификата")
+        cert_info = {
+            'subject': 'TEST CERTIFICATE',
+            'thumbprint': '0000000000000000000000000000000000000000',
+            'has_private_key': True
+        }
+        crypto_pro.cert_info = cert_info
+    else:
+        try:
+            # Интерактивный выбор сертификата
+            cert_info = crypto_pro.select_certificate_interactive()
+            crypto_pro.cert_info = cert_info
+        except CertStoreError as e:
+            print(f"\n❌ Ошибка: {e}")
+            print("\nВозможные решения:")
+            print("1. Убедитесь, что КриптоПро CSP установлен и настроен")
+            print("2. Проверьте наличие установленных сертификатов с закрытым ключом")
+            print("3. Для Linux добавьте пути: export PATH=$PATH:/opt/cprocsp/bin/amd64")
+            print("4. Используйте --help для просмотра всех опций")
+            sys.exit(1)
     
     # Создание клиента API
     client = MarkirovkaClient(crypto_pro)
     
-    # Аутентификация
-    if not client.authenticate(cert_info):
-        print("\n❌ Не удалось выполнить аутентификацию")
-        sys.exit(1)
+    # Аутентификация (в тестовом режиме пропускаем)
+    if args.test_mode:
+        print("ℹ️  Тестовый режим: аутентификация пропущена")
+    else:
+        if not client.authenticate(cert_info):
+            print("\n❌ Не удалось выполнить аутентификацию")
+            sys.exit(1)
     
     # Обработка упаковок
     if args.test_mode:
