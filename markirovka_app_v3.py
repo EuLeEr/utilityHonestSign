@@ -40,14 +40,17 @@ class CryptoProvider:
         self.use_pycades = HAS_PYCADES and not test_mode
         self.cert_path = None
         self.key_path = None
+        self.certmgr_path = None
+        self.cryptcp_path = None
         
-        # Поиск путей к утилитам (только если не тестовый режим)
+        # Поиск путей к утилитам ТОЛЬКО если НЕ тестовый режим
         if not test_mode:
             self.certmgr_path = self._find_utility("certmgr")
             self.cryptcp_path = self._find_utility("cryptcp")
+            print(f"[INFO] certmgr: {self.certmgr_path}")
+            print(f"[INFO] cryptcp: {self.cryptcp_path}")
         else:
-            self.certmgr_path = None
-            self.cryptcp_path = None
+            print("[INFO] Тестовый режим: поиск утилит КриптоПро пропущен.")
 
     def _find_utility(self, name: str) -> Optional[str]:
         """Ищет исполняемый файл в стандартных путях и PATH."""
